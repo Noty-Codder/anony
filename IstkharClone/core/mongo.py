@@ -12,17 +12,12 @@ from IstkharClone import config, logger, userbot
 
 
 class MongoDB:
-    def __init__(self, dbname: str = "IstkharClone", mongo: AsyncMongoClient | None = None):
+    def __init__(self):
         """
         Initialize the MongoDB connection.
-
-        Every bot (main + each clone) gets its *own* database inside the same
-        cluster, so clone data never merges with the main bot or another clone.
         """
-        self.owns_client = mongo is None
-        self.mongo = mongo or AsyncMongoClient(config.MONGO_URL, serverSelectionTimeoutMS=12500)
-        self.dbname = dbname
-        self.db = self.mongo[dbname]
+        self.mongo = AsyncMongoClient(config.MONGO_URL, serverSelectionTimeoutMS=12500)
+        self.db = self.mongo.Anon
 
         self.admin_list = {}
         self.active_calls = {}
@@ -32,7 +27,7 @@ class MongoDB:
         self.loop = {}
         self.notified = []
         self.cache = self.db.cache
-        self.logger = True          # play logger is ON by default
+        self.logger = False
 
         self.assistant = {}
         self.assistantdb = self.db.assistant
@@ -48,17 +43,6 @@ class MongoDB:
 
         self.users = []
         self.usersdb = self.db.users
-
-        # premium per-chat settings (autoplay, thumbnail, equalizer, ...)
-        self.settingsdb = self.db.settings
-        # messages that must be auto-deleted later (player cards, broadcasts)
-        self.trackdb = self.db.tracked_messages
-        self._settings: dict[int, dict] = {}
-
-        # bans: in the main DB these are global (gban), in a clone DB they only
-        # apply to that clone
-        self.bans: set[int] = set()
-        self.maintenance = False
 
     async def connect(self) -> None:
         """Check if we can connect to the database.
@@ -76,18 +60,8 @@ class MongoDB:
 
     async def close(self) -> None:
         """Close the connection to the database."""
-        if not self.owns_client:
-            return
         await self.mongo.close()
         logger.info("Database connection closed.")
-
-    async def connect_clone(self) -> None:
-        """Light start-up for a clone database (client is shared)."""
-        await self.get_chats()
-        await self.get_users()
-        await self.get_blacklisted(True)
-        await self.get_logger()
-        await self.load_bans()
 
     # CACHE
     async def get_call(self, chat_id: int) -> bool:
@@ -176,7 +150,7 @@ class MongoDB:
             num = await self.set_assistant(chat_id)
             self.assistant[chat_id] = num
 
-        return userbot.clients[num - 1]
+        return {1: userbot.one, 2: userbot.two, 3: userbot.three}.get(num)
 
     # BLACKLIST METHODS
     async def add_blacklist(self, chat_id: int) -> None:
@@ -339,100 +313,6 @@ class MongoDB:
         return self.users
 
 
-    # PER-CHAT SETTINGS (autoplay, thumbnail, equalizer, speed ...)
-    async def get_setting(self, chat_id: int, key: str, default=None):
-        if chat_id not in self._settings:
-            doc = await self.settingsdb.find_one({"_id": chat_id}) or {}
-            doc.pop("_id", None)
-            self._settings[chat_id] = doc
-        return self._settings[chat_id].get(key, default)
-
-    async def set_setting(self, chat_id: int, key: str, value) -> None:
-        await self.get_setting(chat_id, key)
-        self._settings[chat_id][key] = value
-        await self.settingsdb.update_one(
-            {"_id": chat_id}, {"$set": {key: value}}, upsert=True
-        )
-
-    def cached(self, chat_id: int, key: str, default=None):
-        """Sync read of an already loaded per-chat setting (for keyboards)."""
-        return self._settings.get(chat_id, {}).get(key, default)
-
-    async def get_autoplay(self, chat_id: int) -> bool:
-        return bool(await self.get_setting(chat_id, "autoplay", False))
-
-    async def set_autoplay(self, chat_id: int, on: bool) -> None:
-        await self.set_setting(chat_id, "autoplay", bool(on))
-
-    async def get_thumb_on(self, chat_id: int) -> bool:
-        return bool(await self.get_setting(chat_id, "thumb", True))
-
-    async def set_thumb_on(self, chat_id: int, on: bool) -> None:
-        await self.set_setting(chat_id, "thumb", bool(on))
-
-    async def get_eq(self, chat_id: int) -> tuple[str, int]:
-        return (
-            await self.get_setting(chat_id, "eq", "normal"),
-            int(await self.get_setting(chat_id, "volume", 100)),
-        )
-
-    async def set_eq(self, chat_id: int, preset: str | None = None, volume: int | None = None) -> None:
-        if preset is not None:
-            await self.set_setting(chat_id, "eq", preset)
-        if volume is not None:
-            await self.set_setting(chat_id, "volume", int(volume))
-
-    async def get_speed(self, chat_id: int) -> float:
-        return float(await self.get_setting(chat_id, "speed", 1.0))
-
-    async def set_speed(self, chat_id: int, speed: float) -> None:
-        await self.set_setting(chat_id, "speed", float(speed))
-
-    # BANS (gban in main DB, clone-gban in a clone DB) + MAINTENANCE
-    async def load_bans(self) -> None:
-        doc = await self.cache.find_one({"_id": "bans"})
-        self.bans = set(doc.get("user_ids", [])) if doc else set()
-        doc = await self.cache.find_one({"_id": "maintenance"})
-        self.maintenance = bool(doc and doc.get("status"))
-
-    async def add_ban(self, user_id: int) -> None:
-        self.bans.add(user_id)
-        await self.cache.update_one(
-            {"_id": "bans"}, {"$addToSet": {"user_ids": user_id}}, upsert=True
-        )
-
-    async def del_ban(self, user_id: int) -> None:
-        self.bans.discard(user_id)
-        await self.cache.update_one({"_id": "bans"}, {"$pull": {"user_ids": user_id}})
-
-    # AUTO-DELETE TRACKING (player cards 24h, broadcasts 48h)
-    async def track_msg(self, chat_id: int, message_id: int, kind: str = "play") -> None:
-        if not chat_id or not message_id:
-            return
-        try:
-            await self.trackdb.update_one(
-                {"chat_id": int(chat_id), "message_id": int(message_id)},
-                {"$set": {"kind": kind, "ts": int(time())}},
-                upsert=True,
-            )
-        except Exception as ex:
-            logger.warning(f"track_msg failed: {ex}")
-
-    async def expired_msgs(self, kind: str, ttl: int, limit: int = 300) -> list[dict]:
-        cutoff = int(time()) - ttl
-        return await self.trackdb.find(
-            {"kind": kind, "ts": {"$lt": cutoff}}
-        ).to_list(length=limit)
-
-    async def forget_msg(self, doc_id) -> None:
-        await self.trackdb.delete_one({"_id": doc_id})
-
-    async def set_maintenance(self, status: bool) -> None:
-        self.maintenance = status
-        await self.cache.update_one(
-            {"_id": "maintenance"}, {"$set": {"status": status}}, upsert=True
-        )
-
     async def migrate_coll(self) -> None:
         logger.info("Migrating users and chats from old collections...")
 
@@ -485,5 +365,6 @@ class MongoDB:
         await self.get_chats()
         await self.get_users()
         await self.get_blacklisted(True)
-        await self.load_bans()
+        await self.get_logger()
         logger.info("Database cache loaded.")
+        
